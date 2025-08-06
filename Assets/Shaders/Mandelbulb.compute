@@ -1,0 +1,141 @@
+#pragma kernel CSMain
+
+static const float EPSILON = 0.001f;
+static const float MAX_RENDER_DISTANCE = 200;
+static const int MAX_STEP = 250;
+
+RWTexture2D<float4> Result;
+float4x4 _CameraToWorld;
+float4x4 _CameraInverseProjection;
+
+float4 _DirectionalLight;
+
+float power;
+float darkness;
+float blackAndWhite;
+float3 colourAMix;
+float3 colourBMix;
+
+struct Ray
+{
+    float3 origin;
+    float3 direction;
+};
+
+Ray CreateRay(float3 origin, float3 direction)
+{
+    Ray ray;
+    ray.origin = origin;
+    ray.direction = direction;
+    return ray;
+}
+
+Ray CreateCameraRay(float2 uv)
+{
+    // Transform the camera origin to world space
+    float3 origin = mul(_CameraToWorld, float4(0.0f, 0.0f, 0.0f, 1.0f)).xyz;
+    
+    // Invert the perspective projection of the view-space position
+    float3 direction = mul(_CameraInverseProjection, float4(uv, 0.0f, 1.0f)).xyz;
+
+    // Transform the direction from camera to world space and normalize
+    direction = mul(_CameraToWorld, float4(direction, 0.0f)).xyz;
+    direction = normalize(direction);
+    return CreateRay(origin, direction);
+}
+
+// Mandelbulb distance estimation:
+// http://blog.hvidtfeldts.net/index.php/2011/09/distance-estimated-3d-fractals-v-the-mandelbulb-different-de-approximations/
+float2 SceneInfo(float3 position)
+{
+    float3 z = position;
+	float dr = 1.0;
+	float r = 0.0;
+    int iterations = 0;
+
+	for (int i = 0; i < 15 ; i++)
+    {
+        iterations = i;
+		r = length(z);
+
+		if (r>2)
+            break;
+        
+		// convert to polar coordinates
+		float theta = acos(z.z/r);
+		float phi = atan2(z.y,z.x);
+		dr =  pow( r, power-1.0)*power*dr + 1.0;
+
+		// scale and rotate the point
+		float zr = pow( r,power);
+		theta = theta*power;
+		phi = phi*power;
+		
+		// convert back to cartesian coordinates
+		z = zr*float3(sin(theta)*cos(phi), sin(phi)*sin(theta), cos(theta));
+		z+=position;
+	}
+
+    float dst = 0.5*log(r)*r/dr;
+	return float2(iterations,dst*1);
+}
+
+float3 EstimateNormal(float3 p) {
+    float x = SceneInfo(float3(p.x + EPSILON, p.y, p.z)).y - SceneInfo(float3(p.x - EPSILON, p.y, p.z)).y;
+    float y = SceneInfo(float3(p.x, p.y + EPSILON, p.z)).y - SceneInfo(float3(p.x, p.y - EPSILON, p.z)).y;
+    float z = SceneInfo(float3(p.x, p.y, p.z + EPSILON)).y - SceneInfo(float3(p.x, p.y, p.z - EPSILON)).y;
+    return normalize(float3(x,y,z));
+}
+
+float4 RayMarching(float4 result, Ray ray)
+{
+    float rayDst = 0;
+
+    for (int i = 0; i < MAX_STEP; ++i)
+    {
+        float3 p = ray.origin + rayDst * ray.direction; // Position of the ray after the distance is applied
+        float2 info = SceneInfo(p);
+        float dst = info.y;
+
+        if (dst < EPSILON)
+        {
+            float escapeIterations = info.x;
+            float3 normal = EstimateNormal(ray.origin - ray.direction * EPSILON * 2);
+
+            float colourA = saturate(dot(normal * .5 + .5, -_DirectionalLight.xyz));
+            float colourB = saturate(escapeIterations / 16.0);
+            float3 colourMix = saturate(colourA * colourAMix + colourB * colourBMix);
+
+            result = float4(colourMix.xyz, 1);
+            break;
+        }
+
+        // Move along the view ray
+        rayDst += dst;
+
+        if(rayDst > MAX_RENDER_DISTANCE)
+            break;
+    }
+
+    float rim = i / darkness;
+    return lerp(result, 1, blackAndWhite) * rim;
+}
+
+[numthreads(8,8,1)]
+void CSMain (uint3 id : SV_DispatchThreadID)
+{
+    // Get the dimensions of the RenderTexture
+    uint width, height;
+    Result.GetDimensions(width, height);
+
+    // Transform pixel to [-1,1] range
+    float2 uv = float2((id.xy + float2(0.5f, 0.5f)) / float2(width, height) * 2.0f - 1.0f);
+
+    float4 result = lerp(float4(51,3,20,1),float4(16,6,28,1),uv.y)/255.0;
+
+    // Get a ray for the UVs
+    Ray ray = CreateCameraRay(uv);
+
+    // Write some colors
+    Result[id.xy] = RayMarching(result, ray);
+}

@@ -1,0 +1,337 @@
+#pragma kernel CSMain
+
+static const float EPSILON = 0.001f;
+static const float MAX_RENDER_DISTANCE = 100;
+static const float SHADOW_BIAS = 0.05f;
+static const int MAX_STEP = 256;
+
+Texture2D<float4> Source;
+RWTexture2D<float4> Result;
+float4x4 _CameraToWorld;
+float4x4 _CameraInverseProjection;
+
+float4 _DirectionalLight;
+
+bool _UseDefaultBackground;
+float3 _BackgroundColor;
+
+bool _GlowActive;
+float3 _LowGlowColor;
+float3 _HighGlowColor;
+float _GlowFallOff;
+
+struct Shape {
+    float3 Position;
+    float3 Rotation;
+    float3 Scale;
+    float3 Color;
+    int ShapeType;
+    int Operation;
+    float BlendStrength;
+    int NumChildren;
+};
+
+StructuredBuffer<Shape> shapes;
+int numShapes;
+
+struct Ray
+{
+    float3 origin;
+    float3 direction;
+};
+
+Ray CreateRay(float3 origin, float3 direction)
+{
+    Ray ray;
+    ray.origin = origin;
+    ray.direction = direction;
+    return ray;
+}
+
+Ray CreateCameraRay(float2 uv)
+{
+    // Transform the camera origin to world space
+    float3 origin = mul(_CameraToWorld, float4(0.0f, 0.0f, 0.0f, 1.0f)).xyz;
+    
+    // Invert the perspective projection of the view-space position
+    float3 direction = mul(_CameraInverseProjection, float4(uv, 0.0f, 1.0f)).xyz;
+
+    // Transform the direction from camera to world space and normalize
+    direction = mul(_CameraToWorld, float4(direction, 0.0f)).xyz;
+    direction = normalize(direction);
+    return CreateRay(origin, direction);
+}
+
+float BoxSDF(float3 p, float3 center, float3 b)
+{
+    float3 q = abs(p - center) - b;
+    return length(max(q, 0.0)) + min(max(q.x, max(q.y, q.z)), 0.0);
+}
+
+float TorusSDF(float3 p, float3 center, float2 t) {
+    float3 rel = p - center;
+    float2 q = float2(length(rel.xz) - t.x, rel.y);
+    return length(q) - t.y;
+}
+
+float SphereSDF(float3 p, float3 center, float radius) {
+    return length(p - center) - radius;
+}
+
+float3x3 GetRotationMatrix(float3 eulerDegrees)
+{
+    float3 rad = radians(eulerDegrees);
+    
+    float cx = cos(rad.x), sx = sin(rad.x);
+    float cy = cos(rad.y), sy = sin(rad.y);
+    float cz = cos(rad.z), sz = sin(rad.z);
+
+    float3x3 rotX = float3x3(
+        1, 0, 0,
+        0, cx, -sx,
+        0, sx, cx
+    );
+
+    float3x3 rotY = float3x3(
+        cy, 0, sy,
+        0, 1, 0,
+        -sy, 0, cy
+    );
+
+    float3x3 rotZ = float3x3(
+        cz, -sz, 0,
+        sz, cz, 0,
+        0, 0, 1
+    );
+
+    return mul(rotZ, mul(rotY, rotX)); // Z * Y * X
+}
+
+float ShapeSDF(float3 p, Shape shape) {
+    // Convert point to local space
+    float3x3 rotMatrix = GetRotationMatrix(shape.Rotation);
+    float3 localP = mul(transpose(rotMatrix), p - shape.Position); // Apply inverse rotation
+
+    if (shape.ShapeType == 0) {
+        return SphereSDF(localP, float3(0,0,0), shape.Scale.x);
+    }
+    else if (shape.ShapeType == 1) {
+        return BoxSDF(localP, float3(0,0,0), shape.Scale);
+    }
+    else if (shape.ShapeType == 2) {
+        return TorusSDF(localP, float3(0,0,0), shape.Scale.xy);
+    }
+
+    return MAX_RENDER_DISTANCE;
+}
+
+// Polynomial smooth min (k = 0.1);
+// https://www.iquilezles.org/www/articles/smin/smin.htm
+float4 Blend( float a, float b, float3 colA, float3 colB, float k )
+{
+    float h = clamp( 0.5+0.5*(b-a)/k, 0.0, 1.0 );
+    float blendDst = lerp( b, a, h ) - k*h*(1.0-h);
+    float3 blendCol = lerp(colB,colA,h);
+    return float4(blendCol, blendDst);
+}
+
+float4 Combine(float dstA, float dstB, float3 colorA, float3 colorB, int operation, float blendStrength) {
+    float dst = dstA;
+    float3 color = colorA;
+
+    if (operation == 0) {
+        if (dstB < dstA) {
+            dst = dstB;
+            color = colorB;
+        }
+    } 
+    // Blend
+    else if (operation == 1) {
+        float4 blend = Blend(dstA, dstB, colorA, colorB, blendStrength);
+        dst = blend.w;
+        color = blend.xyz;
+    }
+    // Cut
+    else if (operation == 2) {
+        // max(a,-b)
+        if (-dstB > dst) {
+            dst = -dstB;
+            color = colorB;
+        }
+    }
+    // Mask
+    else if (operation == 3) {
+        // max(a,b)
+        if (dstB > dst) {
+            dst = dstB;
+            color = colorB;
+        }
+    }
+
+    return float4(color,dst);
+}
+
+// Signed distance function of a point in the scene
+float4 SceneInfo(float3 p)
+{
+    float globalDst = MAX_RENDER_DISTANCE;
+    float3 globalColor = float3(0,0,0);
+    
+    for (int i = 0; i < numShapes; i++) {
+        Shape shape = shapes[i];
+        int numChildren = shape.NumChildren;
+
+        float localDst = ShapeSDF(p, shape);
+        float3 localColor = shape.Color;
+
+        for (int j = 0; j < numChildren; j ++) {
+            Shape childShape = shapes[i + j + 1];
+            float childDst = ShapeSDF(p, childShape);
+
+            float4 combined = Combine(localDst, childDst, localColor, childShape.Color, childShape.Operation, childShape.BlendStrength);
+            localColor = combined.xyz;
+            localDst = combined.w;
+        }
+
+        i+=numChildren; // skip over children in outer loop
+        
+        float4 globalCombined = Combine(globalDst, localDst, globalColor, localColor, shape.Operation, shape.BlendStrength);
+        globalColor = globalCombined.xyz;
+        globalDst = globalCombined.w;        
+    }
+
+    return float4(globalColor, globalDst);
+}
+
+float3 EstimateNormal(float3 p) {
+    float x = SceneInfo(float3(p.x + EPSILON, p.y, p.z)).w - SceneInfo(float3(p.x - EPSILON, p.y, p.z)).w;
+    float y = SceneInfo(float3(p.x, p.y + EPSILON, p.z)).w - SceneInfo(float3(p.x, p.y - EPSILON, p.z)).w;
+    float z = SceneInfo(float3(p.x, p.y, p.z + EPSILON)).w - SceneInfo(float3(p.x, p.y, p.z - EPSILON)).w;
+    return normalize(float3(x,y,z));
+}
+
+float CalculateShadow(Ray ray, float dstToShadePoint) {
+    float rayDst = 0;
+    float shadowIntensity = .2;
+    float brightness = 1;
+
+    while (rayDst < dstToShadePoint) {
+        float3 p = ray.origin + rayDst * ray.direction;
+        float dst = SceneInfo(p).w;
+        
+        if (dst < EPSILON) {
+            return shadowIntensity;
+        }
+
+        brightness = min(brightness, dst * 200);
+        rayDst += dst;
+    }
+    return shadowIntensity + (1 - shadowIntensity) * brightness;
+}
+
+float4 RayMarching(float4 source, Ray ray)
+{
+    float rayDst = 0;
+
+    for (int i = 0; i < MAX_STEP; ++i)
+    {
+        float3 p = ray.origin + rayDst * ray.direction; // Position of the ray after the distance is applied
+        float4 info = SceneInfo(p);
+        float dst = info.w;
+
+        if (dst < EPSILON)
+        {
+            // We're inside the scene surface!
+            
+            // Lighting
+            /*
+            float3 normal = EstimateNormal(p);
+            float3 lightDir = normalize(-_DirectionalLight.xyz);
+            float ambient = 0.02;
+            float diffuse = saturate(dot(normal, lightDir)) * _DirectionalLight.w;
+
+            float3 viewDir = normalize(ray.origin - p);
+            float3 halfDir = normalize(lightDir + viewDir);
+            float specular = pow(saturate(dot(normal, halfDir)), 32.0) * _DirectionalLight.w;
+            float3 lighting = diffuse + specular;
+
+            // Shadows
+            float3 offsetPos = p + normal * SHADOW_BIAS;
+            Ray shadowRay = CreateRay(offsetPos, lightDir);
+            float shadow = CalculateShadow(shadowRay, MAX_RENDER_DISTANCE);
+
+            return float4(info.xyz * (ambient + lighting * shadow), 1);
+            */
+
+            const float ambient = 0.02;
+            float3 normal = EstimateNormal(p);
+            float3 lighting = saturate(dot(normal, _DirectionalLight.xyz) * -1) * _DirectionalLight.w;
+
+            // Shadows
+            float3 offsetPos = p + normal * SHADOW_BIAS; // to avoid self shadowing?
+            float3 dirToLight = -_DirectionalLight.xyz;
+            Ray shadowRay = CreateRay(offsetPos, dirToLight);
+            float dstToLight = MAX_RENDER_DISTANCE;
+            float shadow = CalculateShadow(shadowRay, dstToLight);
+
+            return float4(info.xyz * (ambient + lighting * shadow), 1); // return de color of the surface
+        }
+
+        // Move along the view ray
+        rayDst += dst;
+
+        if(rayDst > MAX_RENDER_DISTANCE)
+            break;
+    }
+
+    // Gone too far; give up
+    if(_UseDefaultBackground)
+        return source;
+    else
+        return float4(_BackgroundColor, 1); // color of the background
+}
+
+// https://adrianb.io/2016/10/01/raymarching.html
+float4 Glow(Ray ray)
+{
+    float t = 0;
+
+    for (int i = 0; i < MAX_STEP; ++i)
+    {
+        float3 p = ray.origin + ray.direction * t;
+        float d = SceneInfo(p).w;
+
+        if (d < EPSILON || t > MAX_RENDER_DISTANCE)
+        {
+            //float perf = (float)i / MAX_STEP; // No smoothness
+            //float perf = pow((float)i / MAX_STEP, 1.5); // No lineal curve
+            float perf = pow(smoothstep(0.0, 1.0, (float)i / MAX_STEP), _GlowFallOff); // Procedural noise
+            float4 color = lerp(float4(_LowGlowColor, 1), float4(_HighGlowColor, 1), perf);
+            return color;
+        }
+        t += d;
+    }
+
+    // Doesn't hit anything
+    return float4(_HighGlowColor, 1);
+}
+
+[numthreads(8,8,1)]
+void CSMain (uint3 id : SV_DispatchThreadID)
+{
+    // Get the dimensions of the RenderTexture
+    uint width, height;
+    Result.GetDimensions(width, height);
+
+    // Transform pixel to [-1,1] range
+    float2 uv = float2((id.xy + float2(0.5f, 0.5f)) / float2(width, height) * 2.0f - 1.0f);
+
+    // Get a ray for the UVs
+    Ray ray = CreateCameraRay(uv);
+
+    // Write some colors
+    if(_GlowActive)
+        Result[id.xy] = Glow(ray);
+    else
+        Result[id.xy] = RayMarching(Source[id.xy], ray);
+}
